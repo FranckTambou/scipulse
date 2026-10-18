@@ -1,0 +1,240 @@
+# =====================================================================
+# SciPulse & SciPulse Insights — infrastructure complète
+#   make up   -> construit les images, démarre tout et initialise
+#               (buckets MinIO, index ES, objets Kibana).
+# Budget mémoire calibré pour une machine 16 Go (ex. Codespaces 4-core).
+# =====================================================================
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./docker/airflow
+  image: scipulse/airflow:2.10.5
+  env_file: .env
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-scipulse-dev-secret}
+    AIRFLOW__WEBSERVER__WORKERS: "2"
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+    # Connexion Spark déclarée par variable d'environnement (aucun clic dans l'UI)
+    AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077?deploy-mode=client
+    PYTHONPATH: /opt/project/src
+    SCIPULSE_HOME: /opt/project
+    MINIO_ENDPOINT: http://minio:9000
+    ES_HOST: http://elasticsearch:9200
+    KIBANA_HOST: http://kibana:5601
+    SPARK_MASTER_URL: spark://spark-master:7077
+    SPARK_DRIVER_HOST: airflow-scheduler
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./src:/opt/project/src
+    - ./spark:/opt/project/spark
+    - ./gx:/opt/project/gx
+    - ./infra:/opt/project/infra
+    - ./notebooks:/opt/project/notebooks
+    - ./tests:/opt/project/tests
+    - ./reports:/opt/project/reports
+    - ./docs:/opt/project/docs
+    - ./logs/pipeline:/opt/project/logs/pipeline
+    - airflow-logs:/opt/airflow/logs
+    - scipulse-tmp:/opt/project/tmp
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-depends
+    postgres:
+      condition: service_healthy
+
+services:
+  # ------------------------------------------------------------------
+  # Métastore Airflow
+  # ------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 10
+    mem_limit: 384m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Data lake Medallion (Bronze / Silver)
+  # ------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-scipulse}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-scipulse-secret}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 10
+    mem_limit: 768m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Couche de serving Gold
+  # ------------------------------------------------------------------
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:${ELASTIC_VERSION:-8.19.0}
+    environment:
+      discovery.type: single-node
+      # Sécurité désactivée : environnement de dev local isolé (voir README §Sécurité)
+      xpack.security.enabled: "false"
+      xpack.ml.enabled: "false"
+      ES_JAVA_OPTS: -Xms${ES_HEAP:-1g} -Xmx${ES_HEAP:-1g}
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' || exit 1"]
+      interval: 15s
+      retries: 20
+    mem_limit: 2g
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:${ELASTIC_VERSION:-8.19.0}
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      NODE_OPTIONS: --max-old-space-size=800
+      TELEMETRY_OPTIN: "false"
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status | grep -q '\"level\":\"available\"' || exit 1"]
+      interval: 15s
+      retries: 30
+    mem_limit: 1200m
+    restart: unless-stopped
+
+  # Logstash : achemine les métriques d'exécution du pipeline vers ES
+  # (index scipulse-pipeline-metrics -> dashboard de monitoring).
+  logstash:
+    image: docker.elastic.co/logstash/logstash:${ELASTIC_VERSION:-8.19.0}
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx512m
+      XPACK_MONITORING_ENABLED: "false"
+    volumes:
+      - ./docker/logstash/pipeline:/usr/share/logstash/pipeline:ro
+      - ./docker/logstash/config/logstash.yml:/usr/share/logstash/config/logstash.yml:ro
+      - ./logs/pipeline:/usr/share/logstash/ingest:ro
+      - logstash-data:/usr/share/logstash/data
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    mem_limit: 900m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Traitement distribué (cluster Spark standalone)
+  # ------------------------------------------------------------------
+  spark-master:
+    build:
+      context: ./docker/spark
+    image: scipulse/spark:3.5.4
+    hostname: spark-master
+    command: ["spark-class", "org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8088:8080"
+    mem_limit: 512m
+    restart: unless-stopped
+
+  spark-worker:
+    image: scipulse/spark:3.5.4
+    hostname: spark-worker
+    command: ["spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077", "--webui-port", "8081"]
+    environment:
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-2560m}
+      SPARK_WORKER_CORES: "2"
+    ports:
+      - "8089:8081"
+    depends_on:
+      - spark-master
+    mem_limit: 3g
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Orchestration
+  # ------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create --username "$${AIRFLOW_ADMIN_USER:-admin}" --password "$${AIRFLOW_ADMIN_PASSWORD:-admin}" \
+          --firstname Franck --lastname Tambou --role Admin --email admin@scipulse.local || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 20s
+      retries: 10
+    mem_limit: 1200m
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    # hostname fixe : les executors Spark rappellent le driver qui tourne ici
+    hostname: airflow-scheduler
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+    mem_limit: 3500m
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Initialisation idempotente : buckets, index templates, Kibana
+  # ------------------------------------------------------------------
+  bootstrap:
+    <<: *airflow-common
+    entrypoint: ["python", "/opt/project/infra/setup/bootstrap.py"]
+    depends_on:
+      minio:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      kibana:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  postgres-data:
+  minio-data:
+  es-data:
+  logstash-data:
+  airflow-logs:
+  scipulse-tmp:

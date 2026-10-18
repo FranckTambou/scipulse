@@ -1,0 +1,29 @@
+# Secrets & environnement local
+.env
+kaggle.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Données & sorties d'exécution (jamais versionnées : elles vivent dans MinIO / ES)
+data/
+logs/pipeline/*.jsonl
+logs/airflow/
+reports/*.json
+reports/*.txt
+!reports/.gitkeep
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Great Expectations : on versionne les suites, pas les résultats bruts
+gx/uncommitted/validations/
+gx/uncommitted/checkpoints/
+gx/uncommitted/data_docs/
+
+# Livrable
+*.zip
